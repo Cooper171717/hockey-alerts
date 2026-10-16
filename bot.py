@@ -59,10 +59,12 @@ def nhl_hats(game):
     for side in ('homeTeam', 'awayTeam'):
         stats = game['playerByGameStats'][side]
         for player in stats.get('forwards', []) + stats.get('defense', []):
-            if int(player.get('goals', 0)) >= 3:
+            goals, assists = int(player.get('goals', 0)), int(player.get('assists', 0))
+            if goals >= 3 or goals + assists >= 5:
                 found.append({'league': 'НХЛ', 'game': str(game['id']),
                               'player': str(player['playerId']), 'name': local_name(player['name']),
                               'team': nhl_team(game[side]), 'goals': int(player['goals']),
+                              'assists': assists, 'points': goals + assists,
                               'match': f"{nhl_team(game['homeTeam'])} — {nhl_team(game['awayTeam'])}",
                               'score': f"{game['homeTeam'].get('score', 0)}:{game['awayTeam'].get('score', 0)}",
                               'date': game['gameDate'],
@@ -77,10 +79,22 @@ def khl_hats(game):
         for player in team['players']:
             goals = next((int(s['val']) for s in player.get('match_stats', [])
                           if s['id'] == 'goals'), 0)
-            if goals >= 3:
+            # KHL's player match_stats does not always contain assists.
+            # Count match goal assists, never the cumulative season field `aps`.
+            assists = next((int(s['val']) for s in player.get('match_stats', [])
+                            if s['id'] == 'assists'), None)
+            if assists is None:
+                assists = sum(1 for goal in game.get('goals', [])
+                              if goal.get('author', {}).get('team_id') == team.get('id')
+                              and str(goal.get('period', '')).lower() not in ('so', 'bullitt')
+                              for assistant in goal.get('assistants', [])
+                              if player.get('shirt_number') is not None
+                              and assistant.get('shirt_number') == player['shirt_number'])
+            if goals >= 3 or goals + assists >= 5:
                 found.append({'league': 'КХЛ', 'game': str(game['khl_id']),
                               'player': str(player['id']), 'name': player['name'],
                               'team': team['name'], 'goals': goals,
+                              'assists': assists, 'points': goals + assists,
                               'match': f"{game['team_a']['name']} — {game['team_b']['name']}",
                               'score': game['score'],
                               'date': dt.datetime.fromtimestamp(game['start_at'] / 1000,
@@ -90,10 +104,30 @@ def khl_hats(game):
 
 
 def message(hat):
-    return (f"🎩 Хет-трик! {hat['league']}\n\n"
+    title = hat.get('title', '🎩 Хет-трик!')
+    return (f"{title} {hat['league']}\n\n"
             f"Игрок: {hat['name']}\nКоманда: {hat['team']}\n"
             f"Матч: {hat['match']}\nСчёт на момент проверки: {hat['score']}\n"
-            f"Дата матча: {hat['date']}\nГолы: {hat['goals']}\n\n{hat['url']}")
+            f"Дата матча: {hat['date']}\nГолы: {hat['goals']}\n"
+            f"Передачи: {hat.get('assists', 0)}\nОчки: {hat.get('points', hat['goals'])}\n\n{hat['url']}")
+
+
+def milestones(hat):
+    """Keep original hat-trick keys so upgrading preserves existing history."""
+    goals = hat['goals']
+    if goals >= 3:
+        level = min(goals, 5)
+        event = dict(hat)
+        event['player'] = hat['player'] if level == 3 else f"{hat['player']}:goals{level}"
+        event['title'] = {3: '🎩 Хет-трик!', 4: '🔥 Покер!', 5: '🚀 Пять голов!'}[level]
+        yield event
+    if hat.get('points', goals) >= 5:
+        yield dict(hat, player=f"{hat['player']}:points5", title='⭐ Пять и более очков за матч!')
+
+
+def deliver(token, chat, text):
+    request(f'https://api.telegram.org/bot{token}/sendMessage',
+            {'chat_id': chat, 'text': text, 'link_preview_options': {'is_disabled': True}})
 
 
 class Store:
@@ -178,18 +212,25 @@ def scan(store, chat, token, dry=False):
             for gid, fetch in source(now):
                 try:
                     for hat in parser(fetch()):
-                        if store.seen(chat, hat):
+                        events = [event for event in milestones(hat) if not store.seen(chat, event)]
+                        if not events:
                             continue
                         if hat['league'] == 'НХЛ':
                             profile = request(f"{NHL}/player/{hat['player']}/landing")
                             hat['name'] = local_name(profile['firstName']) + ' ' + local_name(profile['lastName'])
-                        if dry:
-                            print(message(hat), '\n')
-                        else:
-                            request(f'https://api.telegram.org/bot{token}/sendMessage',
-                                    {'chat_id': chat, 'text': message(hat), 'link_preview_options': {'is_disabled': True}})
-                            store.mark(chat, hat)
-                            LOG.info('Notification delivered: %s %s', hat['league'], hat['game'])
+                        for event in events:
+                            event['name'] = hat['name']
+                            if dry:
+                                print(message(event), '\n')
+                            else:
+                                deliver(token, chat, message(event))
+                                store.mark(chat, event)
+                                # Skip stale lower goal milestones if first seen at 4/5 goals.
+                                if ':points5' not in event['player']:
+                                    for lower in range(3, min(hat['goals'], 5)):
+                                        key = hat['player'] if lower == 3 else f"{hat['player']}:goals{lower}"
+                                        store.mark(chat, dict(hat, player=key))
+                                LOG.info('Notification delivered: %s %s', hat['league'], hat['game'])
                 except Exception as exc:
                     failures += 1
                     LOG.error('Game %s failed (%s)', gid, type(exc).__name__)
@@ -197,6 +238,63 @@ def scan(store, chat, token, dry=False):
             failures += 1
             LOG.error('%s failed (%s)', source.__name__, type(exc).__name__)
     return failures
+
+
+def digest_parts(lines, limit=3500):
+    parts, current = [], ''
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current.rstrip())
+            current = ''
+        current += line + '\n'
+    if current:
+        parts.append(current.rstrip())
+    return parts
+
+
+def morning_digest(store, chat, token, now=None, dry=False):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    moscow = now.astimezone(dt.timezone(dt.timedelta(hours=3)))
+    hour = int(os.getenv('DIGEST_HOUR_MSK', '9'))
+    if not 0 <= hour <= 23:
+        raise ValueError('DIGEST_HOUR_MSK must be 0..23')
+    if moscow.hour < hour:
+        return
+    day = (moscow.date() - dt.timedelta(days=1)).isoformat()
+    key = {'league': 'digest', 'game': day, 'player': 'complete'}
+    if store.seen(chat, key):
+        return
+    games = request(f'{NHL}/score/{day}')['games']
+    lines = [f'☀️ Утренний дайджест НХЛ • {moscow:%d.%m.%Y}',
+             f'Игровой день: {day}. Состояние на {moscow:%H:%M} МСК.', '']
+    if not games:
+        lines.append('В расписании этого игрового дня матчей нет.')
+    hats = []
+    for game in games:
+        state = game['gameState']
+        label = {'OFF': 'завершён', 'FINAL': 'завершён', 'LIVE': 'идёт',
+                 'CRIT': 'идёт', 'FUT': 'не начался', 'PRE': 'не начался'}.get(state, state)
+        score = f"{game['homeTeam'].get('score', '—')}:{game['awayTeam'].get('score', '—')}"
+        lines.append(f"{nhl_team(game['homeTeam'])} — {nhl_team(game['awayTeam'])}: {score} ({label})")
+        if state in ('LIVE', 'CRIT', 'FINAL', 'OFF'):
+            box = request(f"{NHL}/gamecenter/{game['id']}/boxscore")
+            for hat in nhl_hats(box):
+                if hat['goals'] >= 3:
+                    profile = request(f"{NHL}/player/{hat['player']}/landing")
+                    name = local_name(profile['firstName']) + ' ' + local_name(profile['lastName'])
+                    hats.append(f"🎩 {name} ({hat['team']}) — {hat['goals']} гола; {hat['match']}")
+    lines += ['', 'Хет-трики:', *(hats or ['Хет-триков пока нет.'])]
+    for index, text in enumerate(digest_parts(lines)):
+        part_key = dict(key, player=f'part{index}')
+        if store.seen(chat, part_key):
+            continue
+        if dry:
+            print(text, '\n')
+        else:
+            deliver(token, chat, text)
+            store.mark(chat, part_key)
+    if not dry:
+        store.mark(chat, key)
 
 
 def main():
@@ -234,6 +332,11 @@ def main():
     LOG.info('Monitoring KHL and NHL; interval %s seconds', interval)
     while True:
         failures = scan(store, chat, token, args.dry_run)
+        try:
+            morning_digest(store, chat, token, dry=args.dry_run)
+        except Exception as exc:
+            failures += 1
+            LOG.error('Morning digest failed (%s)', type(exc).__name__)
         if args.once or args.dry_run:
             return 1 if failures else 0
         time.sleep(interval)
