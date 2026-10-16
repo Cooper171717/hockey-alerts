@@ -1,0 +1,53 @@
+name: Hockey alerts
+
+on:
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: Send a Telegram connection test
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hockey-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Telegram connection
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_message }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py --test-message
+      - name: Check matches
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py --once --cloud
+      - name: Save delivered notification history
+        if: ${{ always() && !cancelled() }}
+        run: |
+          if [ -f cloud-state.json ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add cloud-state.json
+            if ! git diff --cached --quiet; then
+              git commit -m 'Save delivered hockey alerts'
+              git push
+            fi
+          fi
