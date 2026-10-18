@@ -252,38 +252,95 @@ def digest_parts(lines, limit=3500):
     return parts
 
 
-def morning_digest(store, chat, token, now=None, dry=False):
-    now = now or dt.datetime.now(dt.timezone.utc)
-    moscow = now.astimezone(dt.timezone(dt.timedelta(hours=3)))
-    hour = int(os.getenv('DIGEST_HOUR_MSK', '9'))
-    if not 0 <= hour <= 23:
-        raise ValueError('DIGEST_HOUR_MSK must be 0..23')
-    if moscow.hour < hour:
-        return
-    day = (moscow.date() - dt.timedelta(days=1)).isoformat()
-    key = {'league': 'digest', 'game': day, 'player': 'complete'}
+def khl_day_games(day):
+    """Fetch the entire Moscow calendar day, including games not yet started."""
+    zone = dt.timezone(dt.timedelta(hours=3))
+    start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), zone)
+    end = start + dt.timedelta(days=1)
+    games = {}
+    for page in range(1, 101):
+        query = urllib.parse.urlencode({
+            'q[start_at_gt_time_from_unixtime]': int(start.timestamp()) - 1,
+            'q[start_at_lt_time_from_unixtime]': int(end.timestamp()),
+            'order_direction': 'asc', 'page': page, 'locale': 'ru'})
+        rows = request(f'{KHL}/events_v2.json?{query}')
+        if not isinstance(rows, list):
+            raise ValueError('Unexpected KHL schedule schema')
+        if not rows:
+            return list(games.values())
+        fresh = 0
+        for row in rows:
+            game = row['event']
+            if not (game.get('team_a') and game.get('team_b') and game.get('khl_id')):
+                continue
+            if game.get('type_id') not in (18, 24):
+                continue
+            when = dt.datetime.fromtimestamp(game['start_at'] / 1000, zone)
+            if when.date().isoformat() != day:
+                continue
+            key = str(game['khl_id'])
+            if key not in games:
+                fresh += 1
+            games[key] = game
+        if not fresh:
+            return list(games.values())
+    raise RuntimeError('KHL day pagination limit exceeded')
+
+
+def digest_game_status(league, game):
+    if league == 'НХЛ':
+        if game.get('gameScheduleState') in ('PPD', 'CNCL') or game.get('gameState') in ('PPD', 'CNCL'):
+            return 'excluded'
+        return 'finished' if game.get('gameState') in ('FINAL', 'OFF') else 'pending'
+    state = game.get('game_state_key')
+    if state in ('postponed', 'cancelled', 'canceled'):
+        return 'excluded'
+    return 'finished' if state == 'finished' else 'pending'
+
+
+def completed_day_digest(store, chat, token, league, day, dry=False):
+    # A new namespace deliberately allows final NHL results after an old morning summary.
+    key = {'league': f'final-digest:{league}', 'game': day, 'player': 'complete'}
     if store.seen(chat, key):
         return
-    games = request(f'{NHL}/score/{day}')['games']
-    lines = [f'☀️ Утренний дайджест НХЛ • {moscow:%d.%m.%Y}',
-             f'Игровой день: {day}. Состояние на {moscow:%H:%M} МСК.', '']
+    games = (request(f'{NHL}/score/{day}')['games'] if league == 'НХЛ'
+             else khl_day_games(day))
     if not games:
-        lines.append('В расписании этого игрового дня матчей нет.')
+        return
+    statuses = [digest_game_status(league, game) for game in games]
+    if 'pending' in statuses or 'finished' not in statuses:
+        return
+    lines = [f'🏒 Итоги игрового дня {league} • {day}',
+             'Все состоявшиеся матчи завершены.', '']
     hats = []
-    for game in games:
-        state = game['gameState']
-        label = {'OFF': 'завершён', 'FINAL': 'завершён', 'LIVE': 'идёт',
-                 'CRIT': 'идёт', 'FUT': 'не начался', 'PRE': 'не начался'}.get(state, state)
-        score = f"{game['homeTeam'].get('score', '—')}:{game['awayTeam'].get('score', '—')}"
-        lines.append(f"{nhl_team(game['homeTeam'])} — {nhl_team(game['awayTeam'])}: {score} ({label})")
-        if state in ('LIVE', 'CRIT', 'FINAL', 'OFF'):
+    # Build every result before sending: a source failure must not send a partial summary.
+    for game, status in zip(games, statuses):
+        if league == 'НХЛ':
+            match = f"{nhl_team(game['homeTeam'])} — {nhl_team(game['awayTeam'])}"
+        else:
+            match = f"{game['team_a']['name']} — {game['team_b']['name']}"
+        if status == 'excluded':
+            lines.append(f'{match}: перенесён / отменён')
+            continue
+        if league == 'НХЛ':
+            score = f"{game['homeTeam']['score']}:{game['awayTeam']['score']}"
             box = request(f"{NHL}/gamecenter/{game['id']}/boxscore")
-            for hat in nhl_hats(box):
-                if hat['goals'] >= 3:
-                    profile = request(f"{NHL}/player/{hat['player']}/landing")
-                    name = local_name(profile['firstName']) + ' ' + local_name(profile['lastName'])
-                    hats.append(f"🎩 {name} ({hat['team']}) — {hat['goals']} гола; {hat['match']}")
-    lines += ['', 'Хет-трики:', *(hats or ['Хет-триков пока нет.'])]
+            match = f"{nhl_team(box['homeTeam'])} — {nhl_team(box['awayTeam'])}"
+            players = nhl_hats(box)
+        else:
+            score = game['score']
+            box = request(f"{KHL}/event_v2.json?id={game['id']}&locale=ru")['event']
+            players = khl_hats(box)
+        lines.append(f'{match}: {score}')
+        for hat in players:
+            if hat['goals'] < 3:
+                continue
+            name = hat['name']
+            if league == 'НХЛ':
+                profile = request(f"{NHL}/player/{hat['player']}/landing")
+                name = local_name(profile['firstName']) + ' ' + local_name(profile['lastName'])
+            hats.append(f"🎩 {name} ({hat['team']}) — голы: {hat['goals']}; {match}")
+    lines += ['', 'Хет-трики:', *(hats or ['Хет-триков не было.'])]
     for index, text in enumerate(digest_parts(lines)):
         part_key = dict(key, player=f'part{index}')
         if store.seen(chat, part_key):
@@ -295,6 +352,23 @@ def morning_digest(store, chat, token, now=None, dry=False):
             store.mark(chat, part_key)
     if not dry:
         store.mark(chat, key)
+
+
+def completed_digests(store, chat, token, now=None, dry=False):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    failures = 0
+    for league in ('НХЛ', 'КХЛ'):
+        today = (now.date() if league == 'НХЛ' else
+                 now.astimezone(dt.timezone(dt.timedelta(hours=3))).date())
+        # Include recent dates so a game crossing midnight still completes its original day.
+        for offset in (-2, -1, 0):
+            day = (today + dt.timedelta(days=offset)).isoformat()
+            try:
+                completed_day_digest(store, chat, token, league, day, dry)
+            except Exception as exc:
+                failures += 1
+                LOG.error('Final digest %s %s failed (%s)', league, day, type(exc).__name__)
+    return failures
 
 
 def main():
@@ -332,11 +406,7 @@ def main():
     LOG.info('Monitoring KHL and NHL; interval %s seconds', interval)
     while True:
         failures = scan(store, chat, token, args.dry_run)
-        try:
-            morning_digest(store, chat, token, dry=args.dry_run)
-        except Exception as exc:
-            failures += 1
-            LOG.error('Morning digest failed (%s)', type(exc).__name__)
+        failures += completed_digests(store, chat, token, dry=args.dry_run)
         if args.once or args.dry_run:
             return 1 if failures else 0
         time.sleep(interval)

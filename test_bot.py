@@ -121,50 +121,13 @@ class Tests(unittest.TestCase):
         self.assertTrue(store.seen('1', bot.nhl_hats(self.nhl(3))[0]))
         store.db.close()
 
-    def test_digest_moscow_time_no_games_and_once_per_day(self):
-        store = bot.Store(':memory:')
-        before = dt.datetime(2026, 10, 17, 5, 59, tzinfo=dt.timezone.utc)
-        after = before + dt.timedelta(minutes=2)
-        with patch.dict('os.environ', {'DIGEST_HOUR_MSK': '9'}), patch.object(bot, 'request', return_value={'games': []}) as api, patch.object(bot, 'deliver') as send:
-            bot.morning_digest(store, '1', 'token', before)
-            api.assert_not_called()
-            bot.morning_digest(store, '1', 'token', after)
-            bot.morning_digest(store, '1', 'token', after)
-            self.assertEqual(send.call_count, 1)
-            self.assertIn('2026-10-16', api.call_args.args[0])
-        store.db.close()
 
-    def test_digest_failure_is_retried(self):
-        store = bot.Store(':memory:')
-        now = dt.datetime(2026, 10, 17, 6, 5, tzinfo=dt.timezone.utc)
-        with patch.object(bot, 'request', return_value={'games': []}), patch.object(bot, 'deliver', side_effect=RuntimeError('failed')):
-            with self.assertRaises(RuntimeError):
-                bot.morning_digest(store, '1', 'token', now)
-        self.assertFalse(store.seen('1', {'league': 'digest', 'game': '2026-10-16', 'player': 'complete'}))
-        store.db.close()
 
     def test_digest_long_text_split_under_telegram_limit(self):
         parts = bot.digest_parts(['строка ' * 30] * 80)
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(p) <= 3500 for p in parts))
 
-    def test_digest_results_hat_trick_and_live_status(self):
-        game = dict(self.nhl(3), gameState='LIVE')
-        store = bot.Store(':memory:')
-        now = dt.datetime(2026, 10, 17, 6, 5, tzinfo=dt.timezone.utc)
-        def api(url, data=None):
-            if '/score/' in url:
-                return {'games': [game]}
-            if '/boxscore' in url:
-                return game
-            return {'firstName': {'default': 'Alex'}, 'lastName': {'default': 'Ovechkin'}}
-        with patch.object(bot, 'request', side_effect=api), patch.object(bot, 'deliver') as send:
-            bot.morning_digest(store, '1', 'token', now)
-            text = send.call_args.args[2]
-            self.assertIn('4:2 (идёт)', text)
-            self.assertIn('Alex Ovechkin', text)
-            self.assertIn('Washington Capitals', text)
-        store.db.close()
 
 
 if __name__ == '__main__':
