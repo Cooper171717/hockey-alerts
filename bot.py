@@ -2,6 +2,7 @@
 import argparse
 import datetime as dt
 import hashlib
+from html import escape
 import json
 import logging
 import os
@@ -105,11 +106,20 @@ def khl_hats(game):
 
 def message(hat):
     title = hat.get('title', '🎩 Хет-трик!')
-    return (f"{title} {hat['league']}\n\n"
-            f"Игрок: {hat['name']}\nКоманда: {hat['team']}\n"
-            f"Матч: {hat['match']}\nСчёт на момент проверки: {hat['score']}\n"
-            f"Дата матча: {hat['date']}\nГолы: {hat['goals']}\n"
-            f"Передачи: {hat.get('assists', 0)}\nОчки: {hat.get('points', hat['goals'])}\n\n{hat['url']}")
+    return (f"<b>{escape(title.rstrip('!'))}</b> · {escape(hat['league'])}\n"
+            f"{display_date(hat['date'])}\n\n"
+            f"<b>{escape(hat['name'])}</b>\n{escape(hat['team'])}\n\n"
+            f"Голы <b>{hat['goals']}</b>  ·  Передачи <b>{hat.get('assists', 0)}</b>  ·  "
+            f"Очки <b>{hat.get('points', hat['goals'])}</b>\n\n"
+            f"{escape(hat['match'])}\nСчёт сейчас: <b>{escape(str(hat['score']))}</b>\n\n"
+            f"<a href=\"{escape(hat['url'], quote=True)}\">Открыть матч →</a>")
+
+
+def display_date(value):
+    months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+              'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря')
+    date = dt.date.fromisoformat(value)
+    return f'{date.day} {months[date.month - 1]} {date.year}'
 
 
 def milestones(hat):
@@ -122,12 +132,13 @@ def milestones(hat):
         event['title'] = {3: '🎩 Хет-трик!', 4: '🔥 Покер!', 5: '🚀 Пять голов!'}[level]
         yield event
     if hat.get('points', goals) >= 5:
-        yield dict(hat, player=f"{hat['player']}:points5", title='⭐ Пять и более очков за матч!')
+        yield dict(hat, player=f"{hat['player']}:points5", title='⭐ Пять и более очков!')
 
 
 def deliver(token, chat, text):
     request(f'https://api.telegram.org/bot{token}/sendMessage',
-            {'chat_id': chat, 'text': text, 'link_preview_options': {'is_disabled': True}})
+            {'chat_id': chat, 'text': text, 'parse_mode': 'HTML',
+             'link_preview_options': {'is_disabled': True}})
 
 
 class Store:
@@ -310,8 +321,10 @@ def completed_day_digest(store, chat, token, league, day, dry=False):
     statuses = [digest_game_status(league, game) for game in games]
     if 'pending' in statuses or 'finished' not in statuses:
         return
-    lines = [f'🏒 Итоги игрового дня {league} • {day}',
-             'Все состоявшиеся матчи завершены.', '']
+    count = statuses.count('finished')
+    lines = [f'🏒 <b>{escape(league)} · Итоги дня</b>',
+             display_date(day), '',
+             f'Матчей завершено: <b>{count}</b>', '', '<b>Результаты</b>', '']
     hats = []
     # Build every result before sending: a source failure must not send a partial summary.
     for game, status in zip(games, statuses):
@@ -320,7 +333,7 @@ def completed_day_digest(store, chat, token, league, day, dry=False):
         else:
             match = f"{game['team_a']['name']} — {game['team_b']['name']}"
         if status == 'excluded':
-            lines.append(f'{match}: перенесён / отменён')
+            lines.append(f'{escape(match)}\n<i>Перенесён / отменён</i>\n')
             continue
         if league == 'НХЛ':
             score = f"{game['homeTeam']['score']}:{game['awayTeam']['score']}"
@@ -331,7 +344,7 @@ def completed_day_digest(store, chat, token, league, day, dry=False):
             score = game['score']
             box = request(f"{KHL}/event_v2.json?id={game['id']}&locale=ru")['event']
             players = khl_hats(box)
-        lines.append(f'{match}: {score}')
+        lines.append(f'{escape(match)}\n<b>{escape(str(score))}</b>\n')
         for hat in players:
             if hat['goals'] < 3:
                 continue
@@ -339,9 +352,14 @@ def completed_day_digest(store, chat, token, league, day, dry=False):
             if league == 'НХЛ':
                 profile = request(f"{NHL}/player/{hat['player']}/landing")
                 name = local_name(profile['firstName']) + ' ' + local_name(profile['lastName'])
-            hats.append(f"🎩 {name} ({hat['team']}) — голы: {hat['goals']}; {match}")
-    lines += ['', 'Хет-трики:', *(hats or ['Хет-триков не было.'])]
-    for index, text in enumerate(digest_parts(lines)):
+            hats.append(f"<b>{escape(name)}</b> · голы: <b>{hat['goals']}</b>\n"
+                        f"{escape(hat['team'])}\n{escape(match)}\n")
+    lines += ['🎩 <b>Хет-трики</b>', '', *(hats or ['В этот игровой день хет-триков не было.'])]
+    lines += ['', '<i>Все состоявшиеся матчи завершены.</i>']
+    header = f'🏒 <b>{escape(league)} · Итоги дня</b>\n{display_date(day)}'
+    for index, text in enumerate(digest_parts(lines, limit=3200)):
+        if index:
+            text = f'{header}\n<i>Продолжение · часть {index + 1}</i>\n\n{text}'
         part_key = dict(key, player=f'part{index}')
         if store.seen(chat, part_key):
             continue
